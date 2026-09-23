@@ -6,6 +6,7 @@ from typing import Any
 
 import datarobot as dr
 import httpx
+import pandas as pd
 import httpx_sse
 from datarobot.models.dataset import Dataset
 from datarobot_predict.deployment import predict
@@ -254,95 +255,64 @@ async def get_claims() -> list[ScoredClaim]:
         anomaly_scores: dict[str, float] = {}
         damage_classes: dict[str, str] = {}
 
+        records_df = pd.DataFrame(records)
+
         try:
             fraud_dep = dr.Deployment.get(FRAUD_DEPLOYMENT_ID)
-            fraud_result = predict(fraud_dep, records)
-            if hasattr(fraud_result, "dataframe"):
-                fr_df = fraud_result.dataframe
-                for i, row in enumerate(records):
-                    cid = str(row.get("claim_id", i))
-                    pv = fr_df.iloc[i].get("FRAUD_FLAG_1_PREDICTION", None)
-                    fraud_scores[cid] = safe_float(pv, 0.0) * 100
-            elif hasattr(fraud_result, "predictions"):
-                for i, pred in enumerate(fraud_result.predictions):
-                    cid = str(records[i].get("claim_id", i))
-                    pvs = pred.get("predictionValues", [])
-                    val = 0.0
-                    for pv in pvs:
-                        if str(pv.get("label", "")) == "1":
-                            val = safe_float(pv.get("value", 0.0), 0.0)
-                            break
-                    else:
-                        val = safe_float(pvs[0].get("value", 0.0), 0.0) if pvs else 0.0
-                    fraud_scores[cid] = val * 100
+            fraud_result = predict(fraud_dep, records_df)
+            fr_df = fraud_result.dataframe
+            for i, row in enumerate(records):
+                cid = str(row.get("claim_id", i))
+                pv = fr_df.iloc[i].get("FRAUD_FLAG_1_PREDICTION", None)
+                fraud_scores[cid] = safe_float(pv, 0.0) * 100
         except Exception as e:
-            logger.warning(f"Fraud scoring failed: {e}")
+            logger.error(f"Fraud scoring failed: {e}", exc_info=True)
             for rec in records:
                 fraud_scores[str(rec.get("claim_id", ""))] = safe_float(rec.get("fraud_flag", 0), 0.0) * 100
 
         try:
             anomaly_dep = dr.Deployment.get(ANOMALY_DEPLOYMENT_ID)
-            anomaly_result = predict(anomaly_dep, records)
-            if hasattr(anomaly_result, "dataframe"):
-                an_df = anomaly_result.dataframe
-                for i, row in enumerate(records):
-                    cid = str(row.get("claim_id", i))
-                    col = [c for c in an_df.columns if "anomaly" in c.lower() or "prediction" in c.lower()]
-                    pv = an_df.iloc[i].get(col[0], 0.0) if col else 0.0
-                    anomaly_scores[cid] = safe_float(pv, 0.0)
-            elif hasattr(anomaly_result, "predictions"):
-                for i, pred in enumerate(anomaly_result.predictions):
-                    cid = str(records[i].get("claim_id", i))
-                    pvs = pred.get("predictionValues", [])
-                    val = 0.0
-                    for pv in pvs:
-                        if str(pv.get("label", "")).lower() in ("1", "true", "anomaly"):
-                            val = safe_float(pv.get("value", 0.0), 0.0)
-                            break
-                    else:
-                        val = safe_float(pvs[0].get("value", 0.0), 0.0) if pvs else 0.0
-                    anomaly_scores[cid] = val
+            anomaly_result = predict(anomaly_dep, records_df)
+            an_df = anomaly_result.dataframe
+            logger.info(f"Anomaly model returned columns: {list(an_df.columns)}")
+            anomaly_cols = [c for c in an_df.columns if "anomaly" in c.lower() or "prediction" in c.lower()]
+            if not anomaly_cols:
+                raise ValueError(f"No anomaly score column found in prediction output. Available columns: {list(an_df.columns)}")
+            anomaly_col = anomaly_cols[0]
+            logger.info(f"Using anomaly column: {anomaly_col!r}")
+            for i, row in enumerate(records):
+                cid = str(row.get("claim_id", i))
+                pv = an_df.iloc[i].get(anomaly_col, 0.0)
+                anomaly_scores[cid] = safe_float(pv, 0.0)
         except Exception as e:
-            logger.warning(f"Anomaly scoring failed: {e}")
+            logger.error(f"Anomaly scoring failed: {e}", exc_info=True)
             for rec in records:
                 anomaly_scores[str(rec.get("claim_id", ""))] = 0.0
 
         try:
             damage_dep = dr.Deployment.get(DAMAGE_DEPLOYMENT_ID)
-            damage_result = predict(damage_dep, records)
+            damage_result = predict(damage_dep, records_df)
             classes = ["minor", "moderate", "severe", "total_loss", "unknown"]
-            if hasattr(damage_result, "dataframe"):
-                dm_df = damage_result.dataframe
-                pred_col = [c for c in dm_df.columns if "prediction" in c.lower() and "PREDICTION" in c]
-                if pred_col:
-                    for i, row in enumerate(records):
-                        cid = str(row.get("claim_id", i))
-                        damage_classes[cid] = str(dm_df.iloc[i].get(pred_col[0], "unknown"))
-                else:
-                    class_cols = {c: c.split("_")[-2].lower() for c in dm_df.columns if any(cls in c.lower() for cls in classes)}
-                    for i, row in enumerate(records):
-                        cid = str(row.get("claim_id", i))
-                        best_class = "unknown"
-                        best_val = -1.0
-                        for col, cls in class_cols.items():
-                            v = safe_float(dm_df.iloc[i].get(col, 0.0), 0.0)
-                            if v > best_val:
-                                best_val = v
-                                best_class = cls
-                        damage_classes[cid] = best_class
-            elif hasattr(damage_result, "predictions"):
-                for i, pred in enumerate(damage_result.predictions):
-                    cid = str(records[i].get("claim_id", i))
-                    pvs = pred.get("predictionValues", [])
+            dm_df = damage_result.dataframe
+            pred_col = [c for c in dm_df.columns if "prediction" in c.lower() and "PREDICTION" in c]
+            if pred_col:
+                for i, row in enumerate(records):
+                    cid = str(row.get("claim_id", i))
+                    damage_classes[cid] = str(dm_df.iloc[i].get(pred_col[0], "unknown"))
+            else:
+                class_cols = {c: c.split("_")[-2].lower() for c in dm_df.columns if any(cls in c.lower() for cls in classes)}
+                for i, row in enumerate(records):
+                    cid = str(row.get("claim_id", i))
                     best_class = "unknown"
                     best_val = -1.0
-                    for pv in pvs:
-                        if safe_float(pv.get("value", 0), 0.0) > best_val:
-                            best_val = safe_float(pv.get("value", 0), 0.0)
-                            best_class = str(pv.get("label", "unknown"))
+                    for col, cls in class_cols.items():
+                        v = safe_float(dm_df.iloc[i].get(col, 0.0), 0.0)
+                        if v > best_val:
+                            best_val = v
+                            best_class = cls
                     damage_classes[cid] = best_class
         except Exception as e:
-            logger.warning(f"Damage scoring failed: {e}")
+            logger.error(f"Damage scoring failed: {e}", exc_info=True)
             for rec in records:
                 damage_classes[str(rec.get("claim_id", ""))] = str(rec.get("damage_classification", "unknown") or "unknown")
 

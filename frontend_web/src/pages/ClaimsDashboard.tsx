@@ -52,14 +52,14 @@ function RoutingBadge({ decision }: { decision: string }) {
   );
 }
 
-function ScoreBar({ value, max, color }: { value: number; max: number; color: string }) {
+function ScoreBar({ value, max, color, decimals = 1 }: { value: number; max: number; color: string; decimals?: number }) {
   const pct = Math.min(100, (value / max) * 100);
   return (
     <div className="flex items-center gap-2">
       <div className="flex-1 h-1.5 bg-gray-700 rounded-full overflow-hidden">
         <div className={`h-full rounded-full ${color}`} style={{ width: `${pct}%` }} />
       </div>
-      <span className="text-xs text-gray-300 w-12 text-right font-mono">{value.toFixed(1)}</span>
+      <span className="text-xs text-gray-300 w-12 text-right font-mono">{value.toFixed(decimals)}</span>
     </div>
   );
 }
@@ -722,6 +722,7 @@ export function ClaimsDashboard() {
                                 value={claim.anomaly_score}
                                 max={1}
                                 color={claim.anomaly_score >= 0.5 ? 'bg-red-500' : 'bg-blue-400'}
+                                decimals={3}
                               />
                             </TableCell>
                             <TableCell>

@@ -4,6 +4,7 @@ from typing import Any
 
 import datarobot as dr
 import litellm
+import pandas as pd
 from datarobot.models.dataset import Dataset
 from datarobot_genai.core.agents import make_system_prompt
 from datarobot_genai.langgraph.agent import datarobot_agent_class_from_langgraph
@@ -172,34 +173,30 @@ def score_all_claims() -> str:
     fraud_high = 0
     anomaly_high = 0
     total = len(records)
+    records_df = pd.DataFrame(records)
 
     try:
         fraud_dep = dr.Deployment.get(FRAUD_DEPLOYMENT_ID)
-        fr = predict(fraud_dep, records)
-        if hasattr(fr, "dataframe"):
-            fr_df = fr.dataframe
-            for i in range(len(records)):
-                pv = fr_df.iloc[i].get("FRAUD_FLAG_1_PREDICTION", 0.0)
-                if _safe_float(pv, 0.0) >= 0.7:
-                    fraud_high += 1
+        fr = predict(fraud_dep, records_df)
+        fr_df = fr.dataframe
+        for i in range(len(records)):
+            pv = fr_df.iloc[i].get("FRAUD_FLAG_1_PREDICTION", 0.0)
+            if _safe_float(pv, 0.0) >= 0.7:
+                fraud_high += 1
     except Exception as e:
         return f"Scoring incomplete — fraud model error: {e}"
 
     try:
         anomaly_dep = dr.Deployment.get(ANOMALY_DEPLOYMENT_ID)
-        an = predict(anomaly_dep, records)
-        if hasattr(an, "dataframe"):
-            an_df = an.dataframe
-            cols = [
-                c
-                for c in an_df.columns
-                if "anomaly" in c.lower() or "prediction" in c.lower()
-            ]
-            if cols:
-                for i in range(len(records)):
-                    pv = an_df.iloc[i].get(cols[0], 0.0)
-                    if _safe_float(pv, 0.0) >= 0.5:
-                        anomaly_high += 1
+        an = predict(anomaly_dep, records_df)
+        an_df = an.dataframe
+        cols = [c for c in an_df.columns if "anomaly" in c.lower() or "prediction" in c.lower()]
+        if not cols:
+            raise ValueError(f"No anomaly column found. Available: {list(an_df.columns)}")
+        for i in range(len(records)):
+            pv = an_df.iloc[i].get(cols[0], 0.0)
+            if _safe_float(pv, 0.0) >= 0.5:
+                anomaly_high += 1
     except Exception as e:
         return f"Scoring incomplete — anomaly model error: {e}"
 
@@ -232,19 +229,11 @@ def analyze_claim(claim_id: str) -> str:
     fraud_source = "default"
     try:
         fraud_dep = dr.Deployment.get(FRAUD_DEPLOYMENT_ID)
-        fr = predict(fraud_dep, [record])
-        if hasattr(fr, "dataframe"):
-            pv = fr.dataframe.iloc[0].get("FRAUD_FLAG_1_PREDICTION", None)
-            if pv is not None:
-                fraud_s = _safe_float(pv, 0.0) * 100
-                fraud_source = "fraud model"
-        elif hasattr(fr, "predictions"):
-            pvs = fr.predictions[0].get("predictionValues", [])
-            for pv in pvs:
-                if str(pv.get("label", "")) == "1":
-                    fraud_s = _safe_float(pv.get("value", 0.0), 0.0) * 100
-                    fraud_source = "fraud model"
-                    break
+        fr = predict(fraud_dep, pd.DataFrame([record]))
+        pv = fr.dataframe.iloc[0].get("FRAUD_FLAG_1_PREDICTION", None)
+        if pv is not None:
+            fraud_s = _safe_float(pv, 0.0) * 100
+            fraud_source = "fraud model"
     except Exception as e:
         fraud_s = _safe_float(record.get("fraud_flag", 0), 0.0) * 100
         fraud_source = f"fallback field (model error: {e})"
@@ -254,19 +243,12 @@ def analyze_claim(claim_id: str) -> str:
     anomaly_source = "default"
     try:
         anomaly_dep = dr.Deployment.get(ANOMALY_DEPLOYMENT_ID)
-        an = predict(anomaly_dep, [record])
-        if hasattr(an, "dataframe"):
-            cols = [c for c in an.dataframe.columns if "anomaly" in c.lower() or "prediction" in c.lower()]
-            if cols:
-                anomaly_s = _safe_float(an.dataframe.iloc[0].get(cols[0], 0.0), 0.0)
-                anomaly_source = f"anomaly model (column: {cols[0]})"
-        elif hasattr(an, "predictions"):
-            pvs = an.predictions[0].get("predictionValues", [])
-            for pv in pvs:
-                if str(pv.get("label", "")).lower() in ("1", "true", "anomaly"):
-                    anomaly_s = _safe_float(pv.get("value", 0.0), 0.0)
-                    anomaly_source = "anomaly model"
-                    break
+        an = predict(anomaly_dep, pd.DataFrame([record]))
+        cols = [c for c in an.dataframe.columns if "anomaly" in c.lower() or "prediction" in c.lower()]
+        if not cols:
+            raise ValueError(f"No anomaly column found. Available: {list(an.dataframe.columns)}")
+        anomaly_s = _safe_float(an.dataframe.iloc[0].get(cols[0], 0.0), 0.0)
+        anomaly_source = f"anomaly model (column: {cols[0]})"
     except Exception as e:
         anomaly_source = f"unavailable (error: {e})"
 
@@ -275,32 +257,22 @@ def analyze_claim(claim_id: str) -> str:
     damage_source = "dataset field"
     try:
         damage_dep = dr.Deployment.get(DAMAGE_DEPLOYMENT_ID)
-        dm = predict(damage_dep, [record])
+        dm = predict(damage_dep, pd.DataFrame([record]))
         classes = ["minor", "moderate", "severe", "total_loss", "unknown"]
-        if hasattr(dm, "dataframe"):
-            dm_df = dm.dataframe
-            pred_col = [c for c in dm_df.columns if "prediction" in c.lower() and "PREDICTION" in c]
-            if pred_col:
-                damage_c = str(dm_df.iloc[0].get(pred_col[0], "unknown"))
-                damage_source = "damage model"
-            else:
-                class_cols = {c: c.split("_")[-2].lower() for c in dm_df.columns if any(cls in c.lower() for cls in classes)}
-                best_class, best_val = "unknown", -1.0
-                for col, cls in class_cols.items():
-                    v = _safe_float(dm_df.iloc[0].get(col, 0.0), 0.0)
-                    if v > best_val:
-                        best_val, best_class = v, cls
-                damage_c = best_class
-                damage_source = "damage model (argmax)"
-        elif hasattr(dm, "predictions"):
-            pvs = dm.predictions[0].get("predictionValues", [])
-            best_class, best_val = "unknown", -1.0
-            for pv in pvs:
-                v = _safe_float(pv.get("value", 0), 0.0)
-                if v > best_val:
-                    best_val, best_class = v, str(pv.get("label", "unknown"))
-            damage_c = best_class
+        dm_df = dm.dataframe
+        pred_col = [c for c in dm_df.columns if "prediction" in c.lower() and "PREDICTION" in c]
+        if pred_col:
+            damage_c = str(dm_df.iloc[0].get(pred_col[0], "unknown"))
             damage_source = "damage model"
+        else:
+            class_cols = {c: c.split("_")[-2].lower() for c in dm_df.columns if any(cls in c.lower() for cls in classes)}
+            best_class, best_val = "unknown", -1.0
+            for col, cls in class_cols.items():
+                v = _safe_float(dm_df.iloc[0].get(col, 0.0), 0.0)
+                if v > best_val:
+                    best_val, best_class = v, cls
+            damage_c = best_class
+            damage_source = "damage model (argmax)"
     except Exception as e:
         damage_source = f"dataset fallback (model error: {e})"
 
