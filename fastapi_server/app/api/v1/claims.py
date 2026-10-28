@@ -19,15 +19,12 @@ claims_router = APIRouter(tags=["Claims"])
 
 DATASET_ID = "6a84e3f4bd4eb9abe94a66d4"
 FRAUD_DEPLOYMENT_ID = "6a8734c14864b60d101e7db6"
-DAMAGE_DEPLOYMENT_ID = "6a87421021f6a5e546f65279"
 ANOMALY_DEPLOYMENT_ID = "6a8747e921f2ad7a801e7aff"
 
+# A claim is shown as fraud-flagged when the fraud model's probability is over 50%.
+FRAUD_FLAG_THRESHOLD = 50.0
+
 EXTRA_COLS = [
-    "base_repair_component",
-    "driver_age",
-    "repair_estimate_path",
-    "total_estimate",
-    "vehicle_current_value",
     "image_provided",
     "fnol_path",
     "police_report_path",
@@ -89,6 +86,21 @@ def detect_evidence_gaps(record: dict[str, Any]) -> list[str]:
             gaps.append("Missing medical summary (required for injury claims)")
 
     return gaps
+
+
+def fraud_probability_column(df: pd.DataFrame) -> str:
+    """Return the column holding the positive-class (fraud) probability.
+
+    DataRobot binary deployments return one ``<target>_<class>_PREDICTION`` column per
+    class (e.g. ``fraud_flag_True_PREDICTION``) plus a ``POSITIVE_CLASS`` column.
+    """
+    if "POSITIVE_CLASS" in df.columns and len(df):
+        col = f"fraud_flag_{df['POSITIVE_CLASS'].iloc[0]}_PREDICTION"
+        if col in df.columns:
+            return col
+    if "fraud_flag_True_PREDICTION" in df.columns:
+        return "fraud_flag_True_PREDICTION"
+    raise ValueError(f"No fraud probability column found in prediction output. Available columns: {list(df.columns)}")
 
 
 def compute_red_flags(fraud_score: float, anomaly_score: float, gap_count: int, prior_claims_count: int = 0) -> int:
@@ -177,10 +189,8 @@ def generate_rationale(
 
     rationale_parts = [f"Claim {claim_id} has been routed to '{routing}' (rule {rule_fired})."]
 
-    if fraud_score >= 70:
-        rationale_parts.append(f"High fraud probability ({fraud_score:.0f}%) warrants elevated scrutiny.")
-    elif fraud_score >= 50:
-        rationale_parts.append(f"Moderate fraud probability ({fraud_score:.0f}%) flagged for review.")
+    if fraud_score > FRAUD_FLAG_THRESHOLD:
+        rationale_parts.append("Fraud flag is True (fraud model probability over 50%); claim warrants elevated scrutiny.")
 
     if anomaly_score >= 0.5:
         rationale_parts.append(f"Anomaly detection score ({anomaly_score:.2f}) exceeds threshold, indicating irregular claim patterns.")
@@ -189,7 +199,7 @@ def generate_rationale(
         rationale_parts.append(f"Evidence gaps identified ({len(gaps)}): {'; '.join(gaps[:3])}.")
 
     if red_flag_count > 0:
-        rationale_parts.append(f"{red_flag_count} red flag(s) detected across fraud score, anomaly score, and evidence gaps.")
+        rationale_parts.append(f"{red_flag_count} red flag(s) detected across fraud, anomaly score, and evidence gaps.")
 
     if repair_est >= 25000:
         rationale_parts.append(f"High value claim (${repair_est:,.0f}) requires enhanced validation.")
@@ -218,6 +228,7 @@ class ScoredClaim(BaseModel):
     loss_date: str | None
     loss_type: str | None
     fraud_score: float
+    fraud_flag: bool
     anomaly_score: float
     damage_class: str | None
     routing_decision: str
@@ -261,9 +272,10 @@ async def get_claims() -> list[ScoredClaim]:
             fraud_dep = dr.Deployment.get(FRAUD_DEPLOYMENT_ID)
             fraud_result = predict(fraud_dep, records_df)
             fr_df = fraud_result.dataframe
+            fraud_col = fraud_probability_column(fr_df)
             for i, row in enumerate(records):
                 cid = str(row.get("claim_id", i))
-                pv = fr_df.iloc[i].get("FRAUD_FLAG_1_PREDICTION", None)
+                pv = fr_df.iloc[i].get(fraud_col, None)
                 fraud_scores[cid] = safe_float(pv, 0.0) * 100
         except Exception as e:
             logger.error(f"Fraud scoring failed: {e}", exc_info=True)
@@ -289,32 +301,9 @@ async def get_claims() -> list[ScoredClaim]:
             for rec in records:
                 anomaly_scores[str(rec.get("claim_id", ""))] = 0.0
 
-        try:
-            damage_dep = dr.Deployment.get(DAMAGE_DEPLOYMENT_ID)
-            damage_result = predict(damage_dep, records_df)
-            classes = ["minor", "moderate", "severe", "total_loss", "unknown"]
-            dm_df = damage_result.dataframe
-            pred_col = [c for c in dm_df.columns if "prediction" in c.lower() and "PREDICTION" in c]
-            if pred_col:
-                for i, row in enumerate(records):
-                    cid = str(row.get("claim_id", i))
-                    damage_classes[cid] = str(dm_df.iloc[i].get(pred_col[0], "unknown"))
-            else:
-                class_cols = {c: c.split("_")[-2].lower() for c in dm_df.columns if any(cls in c.lower() for cls in classes)}
-                for i, row in enumerate(records):
-                    cid = str(row.get("claim_id", i))
-                    best_class = "unknown"
-                    best_val = -1.0
-                    for col, cls in class_cols.items():
-                        v = safe_float(dm_df.iloc[i].get(col, 0.0), 0.0)
-                        if v > best_val:
-                            best_val = v
-                            best_class = cls
-                    damage_classes[cid] = best_class
-        except Exception as e:
-            logger.error(f"Damage scoring failed: {e}", exc_info=True)
-            for rec in records:
-                damage_classes[str(rec.get("claim_id", ""))] = str(rec.get("damage_classification", "unknown") or "unknown")
+        # Damage class comes from the dataset's damage_classification column (no predictive model).
+        for rec in records:
+            damage_classes[str(rec.get("claim_id", ""))] = str(rec.get("damage_classification") or "unknown")
 
         scored: list[ScoredClaim] = []
         for rec in records:
@@ -363,6 +352,7 @@ async def get_claims() -> list[ScoredClaim]:
                     loss_date=loss_date_str,
                     loss_type=str(rec.get("loss_type") or "") or None,
                     fraud_score=round(fraud_s, 1),
+                    fraud_flag=fraud_s > FRAUD_FLAG_THRESHOLD,
                     anomaly_score=round(anomaly_s, 3),
                     damage_class=damage_c,
                     routing_decision=routing,
@@ -410,8 +400,12 @@ async def get_claim_recommendation(claim_id: str, request: Request) -> Recommend
     config = deps.config
 
     prompt = (
-        f"Use the analyze_claim tool to fully assess claim {claim_id} — this will call all three "
-        f"predictive models (fraud, anomaly, damage), detect evidence gaps, and apply the rules engine.\n\n"
+        f"Use the analyze_claim tool to fully assess claim {claim_id} — this will call the two "
+        f"predictive models (fraud, anomaly), read the recorded damage classification, detect evidence gaps, "
+        f"and apply the rules engine.\n\n"
+        f"When referring to fraud, describe it ONLY as a fraud flag: 'Fraud flag: True' if the fraud score is "
+        f"over 50%, otherwise 'Fraud flag: False'. Never state the fraud percentage itself, in any section "
+        f"or email.\n\n"
         f"Once you have the tool results, respond with exactly this structure:\n\n"
         f"RATIONALE: <one paragraph explaining the routing decision, citing the specific model scores, "
         f"which rule fired and why, and any evidence gaps or red flags>\n\n"

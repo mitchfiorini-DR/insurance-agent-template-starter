@@ -20,15 +20,9 @@ litellm.modify_params = True
 
 DATASET_ID = "6a84e3f4bd4eb9abe94a66d4"
 FRAUD_DEPLOYMENT_ID = "6a8734c14864b60d101e7db6"
-DAMAGE_DEPLOYMENT_ID = "6a87421021f6a5e546f65279"
 ANOMALY_DEPLOYMENT_ID = "6a8747e921f2ad7a801e7aff"
 
 EXTRA_COLS = [
-    "base_repair_component",
-    "driver_age",
-    "repair_estimate_path",
-    "total_estimate",
-    "vehicle_current_value",
     "image_provided",
     "fnol_path",
     "police_report_path",
@@ -61,6 +55,21 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return f
     except (TypeError, ValueError):
         return default
+
+
+def _fraud_probability_column(df: pd.DataFrame) -> str:
+    """Return the column holding the positive-class (fraud) probability.
+
+    DataRobot binary deployments return one ``<target>_<class>_PREDICTION`` column per
+    class (e.g. ``fraud_flag_True_PREDICTION``) plus a ``POSITIVE_CLASS`` column.
+    """
+    if "POSITIVE_CLASS" in df.columns and len(df):
+        col = f"fraud_flag_{df['POSITIVE_CLASS'].iloc[0]}_PREDICTION"
+        if col in df.columns:
+            return col
+    if "fraud_flag_True_PREDICTION" in df.columns:
+        return "fraud_flag_True_PREDICTION"
+    raise ValueError(f"No fraud probability column found. Available: {list(df.columns)}")
 
 
 def _sanitize(record: dict[str, Any]) -> dict[str, Any]:
@@ -179,8 +188,9 @@ def score_all_claims() -> str:
         fraud_dep = dr.Deployment.get(FRAUD_DEPLOYMENT_ID)
         fr = predict(fraud_dep, records_df)
         fr_df = fr.dataframe
+        fraud_col = _fraud_probability_column(fr_df)
         for i in range(len(records)):
-            pv = fr_df.iloc[i].get("FRAUD_FLAG_1_PREDICTION", 0.0)
+            pv = fr_df.iloc[i].get(fraud_col, 0.0)
             if _safe_float(pv, 0.0) >= 0.7:
                 fraud_high += 1
     except Exception as e:
@@ -208,8 +218,8 @@ def score_all_claims() -> str:
 
 @tool
 def analyze_claim(claim_id: str) -> str:
-    """Fully analyze a specific claim by ID using all three predictive models (fraud, anomaly, damage),
-    detect evidence gaps, compute red flags, and apply the deterministic routing rules engine (R0-R6).
+    """Fully analyze a specific claim by ID using the two predictive models (fraud, anomaly) and the
+    recorded damage classification from the dataset, detect evidence gaps, compute red flags, and apply the deterministic routing rules engine (R0-R6).
     Returns a complete structured assessment the agent can use to produce rationale and recommendations."""
     _init_dr()
     dataset = Dataset.get(DATASET_ID)
@@ -230,7 +240,8 @@ def analyze_claim(claim_id: str) -> str:
     try:
         fraud_dep = dr.Deployment.get(FRAUD_DEPLOYMENT_ID)
         fr = predict(fraud_dep, pd.DataFrame([record]))
-        pv = fr.dataframe.iloc[0].get("FRAUD_FLAG_1_PREDICTION", None)
+        fr_df = fr.dataframe
+        pv = fr_df.iloc[0].get(_fraud_probability_column(fr_df), None)
         if pv is not None:
             fraud_s = _safe_float(pv, 0.0) * 100
             fraud_source = "fraud model"
@@ -252,29 +263,8 @@ def analyze_claim(claim_id: str) -> str:
     except Exception as e:
         anomaly_source = f"unavailable (error: {e})"
 
-    # --- Damage model ---
+    # --- Damage classification (recorded in the dataset; no predictive model) ---
     damage_c = str(record.get("damage_classification") or "unknown")
-    damage_source = "dataset field"
-    try:
-        damage_dep = dr.Deployment.get(DAMAGE_DEPLOYMENT_ID)
-        dm = predict(damage_dep, pd.DataFrame([record]))
-        classes = ["minor", "moderate", "severe", "total_loss", "unknown"]
-        dm_df = dm.dataframe
-        pred_col = [c for c in dm_df.columns if "prediction" in c.lower() and "PREDICTION" in c]
-        if pred_col:
-            damage_c = str(dm_df.iloc[0].get(pred_col[0], "unknown"))
-            damage_source = "damage model"
-        else:
-            class_cols = {c: c.split("_")[-2].lower() for c in dm_df.columns if any(cls in c.lower() for cls in classes)}
-            best_class, best_val = "unknown", -1.0
-            for col, cls in class_cols.items():
-                v = _safe_float(dm_df.iloc[0].get(col, 0.0), 0.0)
-                if v > best_val:
-                    best_val, best_class = v, cls
-            damage_c = best_class
-            damage_source = "damage model (argmax)"
-    except Exception as e:
-        damage_source = f"dataset fallback (model error: {e})"
 
     # --- Evidence gaps ---
     gaps = _detect_gaps(record)
@@ -308,7 +298,7 @@ def analyze_claim(claim_id: str) -> str:
         f"\nSCORES (from predictive models):"
         f"\n  Fraud score: {fraud_s:.1f}% [source: {fraud_source}]"
         f"\n  Anomaly score: {anomaly_s:.3f} [source: {anomaly_source}]"
-        f"\n  Damage classification: {damage_c} [source: {damage_source}]"
+        f"\n  Damage classification: {damage_c} [source: dataset damage_classification field]"
         f"\n\nCLAIM DATA:"
         f"\n  Repair estimate: ${repair_est:,.0f}"
         f"\n  Injury flag: {injury}"
@@ -346,7 +336,8 @@ def graph_factory(
             "You are an expert P&C motor insurance claims processing assistant.\n\n"
             "Your role is to:\n"
             "1. Load and analyze FNOL (First Notice of Loss) records from the DataRobot dataset\n"
-            "2. Score claims using three predictive models: fraud detection, damage classification, anomaly\n"
+            "2. Score claims using two predictive models: fraud detection and anomaly detection. "
+            "Damage classification is read from the dataset, not predicted.\n"
             "3. Apply deterministic rules (R0-R6) to determine routing — rules are fixed, you explain them\n"
             "4. Generate clear, natural language explanations of scoring outcomes\n"
             "5. Identify evidence gaps and recommend next actions\n\n"

@@ -13,6 +13,8 @@ export interface ScoredClaim {
   loss_date: string | null;
   loss_type: string | null;
   fraud_score: number;
+  /** True when the fraud model probability is over 50%. */
+  fraud_flag: boolean;
   anomaly_score: number;
   damage_class: string | null;
   routing_decision: string;

@@ -4,7 +4,7 @@ system_prompt: |
 
   Your responsibilities:
   1. Retrieve and analyze FNOL records from the DataRobot dataset
-  2. Score each claim using three predictive models: fraud detection, damage classification, and anomaly detection
+  2. Score each claim using two predictive models: fraud detection and anomaly detection. Damage classification is read from the dataset's damage_classification field (no predictive model); "unknown" damage means liability is not clear.
   3. Apply deterministic rules (R0–R6) to determine routing decisions
   4. Generate natural language explanations of scoring outcomes and routing rationale
   5. Identify evidence gaps in submitted claims
@@ -44,16 +44,6 @@ tools:
       - arg_name: fraud_scores
         type: dict
         object_schema: "Map of claim_id to fraud probability (0-1)"
-
-  - function_name: score_damage
-    inputs:
-      - arg_name: records
-        type: list
-        object_schema: "List of claim records to classify damage"
-    out:
-      - arg_name: damage_scores
-        type: dict
-        object_schema: "Map of claim_id to damage classification and confidence"
 
   - function_name: score_anomaly
     inputs:
@@ -124,12 +114,13 @@ examples:
 frontend:
   type: "multi-page"
   pages:
-    - "Claims Dashboard - Main table showing all FNOL claims with fraud score, anomaly score, routing decision, rule fired, gap count, and color-coded routing badge. Supports search by claim ID, insured ID, loss type. Sortable columns."
+    - "Claims Dashboard - Main table showing all FNOL claims with fraud flag, anomaly score, routing decision, rule fired, gap count, and color-coded routing badge. Supports search by claim ID, insured ID, loss type. Sortable columns."
     - "Claim Detail - Expandable audit trail panel per claim showing rule trace (R0-R6 with pass/fail), evidence gaps, scores, LLM rationale, and recommended action."
   requirements: |
     - Dark theme professional UI, full-window layout
     - NO chat interface - dashboard only
-    - Claims table columns: Claim ID, Insured ID, Date, Fraud Score, Anomaly Score, Routing Decision (color badge), Rule Fired, Gap Count
+    - Claims table columns: Claim ID, Insured ID, Date, Fraud Flag, Anomaly Score, Routing Decision (color badge), Rule Fired, Gap Count
+    - Fraud Flag is True/False: True when the fraud model probability is over 50%, otherwise False. The raw fraud percentage is not shown in the UI.
     - NO damage category or confidence columns in the table
     - Color badges: Recommend Decline Review=red, Complex=orange, More Info Needed=yellow, Standard=blue, Fast Track=green
     - Expandable per-claim audit trail with rule trace, gaps, rationale (break-words whitespace-normal CSS)
@@ -137,5 +128,4 @@ frontend:
     - Sortable columns
     - DataRobot dataset ID: 6a84e3f4bd4eb9abe94a66d4
     - Fraud deployment ID: 6a8734c14864b60d101e7db6
-    - Damage classification deployment ID: 6a87421021f6a5e546f65279
     - Anomaly deployment ID: 6a8747e921f2ad7a801e7aff

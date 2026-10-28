@@ -17,7 +17,7 @@ type SortField =
   | 'claim_id'
   | 'insured_id'
   | 'loss_date'
-  | 'fraud_score'
+  | 'fraud_flag'
   | 'anomaly_score'
   | 'routing_decision'
   | 'rule_fired'
@@ -61,6 +61,20 @@ function ScoreBar({ value, max, color, decimals = 1 }: { value: number; max: num
       </div>
       <span className="text-xs text-gray-300 w-12 text-right font-mono">{value.toFixed(decimals)}</span>
     </div>
+  );
+}
+
+function FraudFlagBadge({ flagged }: { flagged: boolean }) {
+  const cls = flagged
+    ? 'bg-red-950 text-red-300 border-red-800'
+    : 'bg-gray-800 text-gray-400 border-gray-700';
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold border ${cls} whitespace-nowrap`}
+    >
+      <span className={`w-1.5 h-1.5 rounded-full ${flagged ? 'bg-red-500' : 'bg-gray-500'}`} />
+      {flagged ? 'True' : 'False'}
+    </span>
   );
 }
 
@@ -364,16 +378,14 @@ function AuditTrail({ claim }: { claim: ScoredClaim }) {
         {/* Score cards */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <div className="bg-gray-800 rounded-lg p-3 border border-gray-700">
-            <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">Fraud Score</div>
-            <div className="text-2xl font-bold text-white">{claim.fraud_score.toFixed(1)}%</div>
+            <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">Fraud Flag</div>
             <div
-              className={`text-xs mt-1 ${claim.fraud_score >= 70 ? 'text-red-400' : claim.fraud_score >= 50 ? 'text-orange-400' : 'text-emerald-400'}`}
+              className={`text-2xl font-bold ${claim.fraud_flag ? 'text-red-400' : 'text-white'}`}
             >
-              {claim.fraud_score >= 70
-                ? 'HIGH RISK'
-                : claim.fraud_score >= 50
-                  ? 'MODERATE'
-                  : 'LOW RISK'}
+              {claim.fraud_flag ? 'True' : 'False'}
+            </div>
+            <div className={`text-xs mt-1 ${claim.fraud_flag ? 'text-red-400' : 'text-emerald-400'}`}>
+              {claim.fraud_flag ? 'FLAGGED' : 'NOT FLAGGED'}
             </div>
           </div>
           <div className="bg-gray-800 rounded-lg p-3 border border-gray-700">
@@ -518,8 +530,11 @@ export function ClaimsDashboard() {
 
   const sorted = useMemo(() => {
     return [...filtered].sort((a, b) => {
-      let av: string | number = a[sortField] ?? '';
-      let bv: string | number = b[sortField] ?? '';
+      // Booleans sort as numbers (false < true) so flagged claims group together.
+      const toSortable = (v: string | number | boolean | null): string | number =>
+        typeof v === 'boolean' ? Number(v) : (v ?? '');
+      let av = toSortable(a[sortField]);
+      let bv = toSortable(b[sortField]);
       if (typeof av === 'string') av = av.toLowerCase();
       if (typeof bv === 'string') bv = bv.toLowerCase();
       if (av < bv) return sortDir === 'asc' ? -1 : 1;
@@ -531,12 +546,12 @@ export function ClaimsDashboard() {
   const stats = useMemo(() => {
     if (!claims) return null;
     const routingCounts: Record<string, number> = {};
-    let highFraud = 0;
+    let fraudFlagged = 0;
     for (const c of claims) {
       routingCounts[c.routing_decision] = (routingCounts[c.routing_decision] ?? 0) + 1;
-      if (c.fraud_score >= 70) highFraud++;
+      if (c.fraud_flag) fraudFlagged++;
     }
-    return { total: claims.length, highFraud, routingCounts };
+    return { total: claims.length, fraudFlagged, routingCounts };
   }, [claims]);
 
   const thClass =
@@ -599,9 +614,9 @@ export function ClaimsDashboard() {
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <StatCard label="Total Claims" value={stats?.total ?? 0} sub="All FNOL records" />
               <StatCard
-                label="High Fraud Risk"
-                value={stats?.highFraud ?? 0}
-                sub="Score ≥ 70%"
+                label="Fraud Flagged"
+                value={stats?.fraudFlagged ?? 0}
+                sub="Fraud flag = True"
                 color="text-red-400"
               />
               <StatCard
@@ -663,9 +678,9 @@ export function ClaimsDashboard() {
                       <TableHead className={thClass} onClick={() => handleSort('loss_date')}>
                         Date <SortIcon field="loss_date" current={sortField} dir={sortDir} />
                       </TableHead>
-                      <TableHead className={thClass} onClick={() => handleSort('fraud_score')}>
-                        Fraud Score{' '}
-                        <SortIcon field="fraud_score" current={sortField} dir={sortDir} />
+                      <TableHead className={thClass} onClick={() => handleSort('fraud_flag')}>
+                        Fraud Flag{' '}
+                        <SortIcon field="fraud_flag" current={sortField} dir={sortDir} />
                       </TableHead>
                       <TableHead className={thClass} onClick={() => handleSort('anomaly_score')}>
                         Anomaly <SortIcon field="anomaly_score" current={sortField} dir={sortDir} />
@@ -704,18 +719,8 @@ export function ClaimsDashboard() {
                             <TableCell className="text-sm text-gray-400 whitespace-nowrap">
                               {claim.loss_date ? claim.loss_date.split('T')[0] : '—'}
                             </TableCell>
-                            <TableCell className="min-w-32">
-                              <ScoreBar
-                                value={claim.fraud_score}
-                                max={100}
-                                color={
-                                  claim.fraud_score >= 70
-                                    ? 'bg-red-500'
-                                    : claim.fraud_score >= 50
-                                      ? 'bg-orange-400'
-                                      : 'bg-emerald-500'
-                                }
-                              />
+                            <TableCell>
+                              <FraudFlagBadge flagged={claim.fraud_flag} />
                             </TableCell>
                             <TableCell className="min-w-28">
                               <ScoreBar
